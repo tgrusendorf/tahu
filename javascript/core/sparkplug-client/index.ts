@@ -30,9 +30,9 @@ const logger = {
     info: (formatter: string, ...args: unknown[]) => infoLog(formatter, ...args),
 }
 
-function getRequiredProperty<C extends Record<string, unknown>, P extends keyof C & string>(config: C, propName: P): C[P] {
+function getRequiredProperty<C, P extends keyof C & string>(config: C, propName: P): Exclude<C[P], undefined> {
     if (config[propName] !== undefined) {
-        return config[propName];
+        return config[propName] as Exclude<C[P], undefined>;
     }
     throw new Error("Missing required configuration property '" + propName + "'");
 }
@@ -45,17 +45,20 @@ function getProperty<C, P extends keyof C, DEFAULT extends C[P]>(config: C, prop
     }
 }
 
-export type ISparkplugClientOptions = {
-    serverUrl: string;
-    username: string;
-    password: string;
+export interface ISparkplugClientOptions {
     groupId: string;
     edgeNode: string;
-    clientId: string;
     publishDeath?: boolean;
     version?: string;
+
+    serverUrl?: string;
+    username?: string;
+    password?: string;
+    clientId?: string;
     keepalive?: number;
     mqttOptions?: Omit<IClientOptions, 'clientId' | 'clean' | 'keepalive' | 'reschedulePings' | 'connectTimeout' | 'username' | 'password' | 'will'>;
+
+    mqttClient?: MqttClient;
 }
 
 export type PayloadOptions = {
@@ -99,19 +102,20 @@ class SparkplugClient extends events.EventEmitter {
     private readonly versionB: string = "spBv1.0";
 
     // Config Variables
-    private serverUrl: string;
+    private serverUrl: string | null = null;
     private groupId: string;
     private edgeNode: string;
     private publishDeath: boolean;
     private version: string;
-    private mqttOptions: IClientOptions;
+    private mqttOptions: null | IClientOptions = null;
 
     // MQTT Client Variables
     private bdSeq = 0;
     private seq = 0;
-    private client: null | MqttClient = null;
+    private client: MqttClient;
     private connecting = false;
     private connected = false;
+    private clientProvided;
 
     constructor(config: ISparkplugClientOptions) {
         super();
@@ -119,29 +123,41 @@ class SparkplugClient extends events.EventEmitter {
         this.edgeNode = getRequiredProperty(config, "edgeNode");
         this.publishDeath = getProperty(config, "publishDeath", false);
         this.version = getProperty(config, "version", this.versionB);
+        this.clientProvided = Boolean(config.mqttClient);
 
-        // Client connection options
-        this.serverUrl = getRequiredProperty(config, "serverUrl");
-        const username = getRequiredProperty(config, "username");
-        const password = getRequiredProperty(config, "password");
-        const clientId = getRequiredProperty(config, "clientId");
-        const keepalive = getProperty(config, "keepalive", 5);
-        this.mqttOptions = {
-            ...config.mqttOptions || {}, // allow additional options
-            clientId,
-            clean: true,
-            keepalive,
-            reschedulePings: false,
-            connectTimeout: 30000,
-            username,
-            password,
-            will: {
-                topic: this.version + "/" + this.groupId + "/NDEATH/" + this.edgeNode,
-                payload: Buffer.from(this.encodePayload(this.getDeathPayload())),
-                qos: 0,
-                retain: false,
-            },
-        };
+        // Client options
+        if (this.clientProvided) {
+            this.client = getRequiredProperty(config, 'mqttClient');
+        } else {
+            this.serverUrl = getRequiredProperty(config, "serverUrl");
+            const username = getRequiredProperty(config, "username");
+            const password = getRequiredProperty(config, "password");
+            const clientId = getRequiredProperty(config, "clientId");
+            const keepalive = getProperty(config, "keepalive", 5);
+            this.mqttOptions = {
+                ...config.mqttOptions || {}, // allow additional options
+                clientId,
+                clean: true,
+                keepalive,
+                reschedulePings: false,
+                connectTimeout: 30000,
+                username,
+                password,
+                will: {
+                    topic: this.version + "/" + this.groupId + "/NDEATH/" + this.edgeNode,
+                    payload: Buffer.from(this.encodePayload(this.getDeathPayload())),
+                    qos: 0,
+                    retain: false,
+                },
+            };
+
+            // Connect to the MQTT server
+            this.connecting = true;
+            logger.debug("Attempting to connect: " + this.serverUrl);
+            logger.debug("              options: " + JSON.stringify(this.mqttOptions));
+            this.client = mqtt.connect(this.serverUrl, this.mqttOptions);
+            logger.debug("Finished attempting to connect");
+        }
 
         this.init();
     }
@@ -282,12 +298,12 @@ class SparkplugClient extends events.EventEmitter {
 
     subscribeTopic(topic: string, options: mqtt.IClientSubscribeOptions = { "qos": 0 }, callback?: mqtt.ClientSubscribeCallback) {
         logger.info("Subscribing to topic:", topic);
-        this.client!.subscribe(topic, options, callback);
+        this.client.subscribe(topic, options, callback);
     }
 
     unsubscribeTopic(topic: string, options?: any, callback?: mqtt.PacketCallback) {
         logger.info("Unsubscribing topic:", topic);
-        this.client!.unsubscribe(topic, options, callback);
+        this.client.unsubscribe(topic, options, callback);
     }
 
     // Publishes Node BIRTH certificates for the edge node
@@ -310,7 +326,7 @@ class SparkplugClient extends events.EventEmitter {
         // Publish BIRTH certificate for edge node
         logger.info("Publishing Edge Node Birth");
         let p = this.maybeCompressPayload(payload, options);
-        this.client!.publish(topic, Buffer.from(this.encodePayload(p)));
+        this.client.publish(topic, Buffer.from(this.encodePayload(p)));
         this.messageAlert("published", topic, p);
     }
 
@@ -321,7 +337,7 @@ class SparkplugClient extends events.EventEmitter {
         this.addSeqNumber(payload);
         // Publish
         logger.info("Publishing NDATA");
-        this.client!.publish(topic, Buffer.from(this.encodePayload(this.maybeCompressPayload(payload, options))));
+        this.client.publish(topic, Buffer.from(this.encodePayload(this.maybeCompressPayload(payload, options))));
         this.messageAlert("published", topic, payload);
     }
 
@@ -332,7 +348,7 @@ class SparkplugClient extends events.EventEmitter {
         this.addSeqNumber(payload);
         // Publish
         logger.info("Publishing DDATA for device " + deviceId);
-        this.client!.publish(topic, Buffer.from(this.encodePayload(this.maybeCompressPayload(payload, options))));
+        this.client.publish(topic, Buffer.from(this.encodePayload(this.maybeCompressPayload(payload, options))));
         this.messageAlert("published", topic, payload);
     };
 
@@ -344,7 +360,7 @@ class SparkplugClient extends events.EventEmitter {
         // Publish
         logger.info("Publishing DBIRTH for device " + deviceId);
         let p = this.maybeCompressPayload(payload, options);
-        this.client!.publish(topic, Buffer.from(this.encodePayload(p)));
+        this.client.publish(topic, Buffer.from(this.encodePayload(p)));
         this.messageAlert("published", topic, p);
     }
 
@@ -356,7 +372,7 @@ class SparkplugClient extends events.EventEmitter {
         this.addSeqNumber(payload);
         // Publish
         logger.info("Publishing DDEATH for device " + deviceId);
-        this.client!.publish(topic, Buffer.from(this.encodePayload(this.maybeCompressPayload(payload, options))));
+        this.client.publish(topic, Buffer.from(this.encodePayload(this.maybeCompressPayload(payload, options))));
         this.messageAlert("published", topic, payload);
     }
 
@@ -364,38 +380,49 @@ class SparkplugClient extends events.EventEmitter {
         logger.debug("publishDeath: " + this.publishDeath);
         if (this.publishDeath) {
             // Publish the DEATH certificate
-            this.publishNDeath(this.client!);
+            this.publishNDeath(this.client);
         }
-        this.client!.end();
+        if (!this.clientProvided) {
+            // only end the client if it was created by this class,
+            // otherwise it could still be used elsewhere and closing it would cause problems
+            this.client.end();
+        }
     }
 
-    // Configures and connects the client
+    // Configures the client
     private init() {
-
-        // Connect to the MQTT server
-        this.connecting = true;
-        logger.debug("Attempting to connect: " + this.serverUrl);
-        logger.debug("              options: " + JSON.stringify(this.mqttOptions));
-        this.client = mqtt.connect(this.serverUrl, this.mqttOptions);
-        logger.debug("Finished attempting to connect");
-
+        const sparkplugTopicPatterns: string[] = [];
+        
         /*
          * 'connect' handler
          */
-        this.client.on('connect', () => {
+        const afterConnected = () => {
             logger.info("Client has connected");
             this.connecting = false;
             this.connected = true;
-            this.emit("connect");
+            this.emit('connect');
 
             // Subscribe to control/command messages for both the edge node and the attached devices
             logger.info("Subscribing to control/command messages for both the edge node and the attached devices");
-            this.client!.subscribe(this.version + "/" + this.groupId + "/NCMD/" + this.edgeNode + "/#", { "qos": 0 });
-            this.client!.subscribe(this.version + "/" + this.groupId + "/DCMD/" + this.edgeNode + "/#", { "qos": 0 });
+            const ncmdTopicBase = this.version + "/" + this.groupId + "/NCMD/" + this.edgeNode;
+            const dcmdTopicBase = this.version + "/" + this.groupId + "/DCMD/" + this.edgeNode;
+            sparkplugTopicPatterns.push(ncmdTopicBase);
+            sparkplugTopicPatterns.push(dcmdTopicBase);
+            this.client.subscribe(ncmdTopicBase + "/#", { "qos": 0 });
+            this.client.subscribe(dcmdTopicBase + "/#", { "qos": 0 });
 
             // Emit the "birth" event to notify the application to send a births
             this.emit("birth");
-        });
+        };
+
+        if (this.client.connected) {
+            this.connecting = false;
+            this.connected = true;
+            afterConnected(); // call immediately, already connected
+        } else {
+            this.connecting = true;
+            this.client.on('connect', afterConnected); // call after connected.
+        }
 
         /*
          * 'error' handler
@@ -403,7 +430,11 @@ class SparkplugClient extends events.EventEmitter {
         this.client.on('error', (error) => {
             if (this.connecting) {
                 this.emit("error", error);
-                this.client!.end();
+                if (!this.clientProvided) {
+                    // only end the client if it was created by this class,
+                    // otherwise it could still be used elsewhere and closing it would cause problems
+                    this.client.end();
+                }
             }
         });
 
@@ -449,10 +480,23 @@ class SparkplugClient extends events.EventEmitter {
          * 'message' handler
          */
         this.client.on('message', (topic, message) => {
-            let payload = this.maybeDecompressPayload(this.decodePayload(message)),
-                timestamp = payload.timestamp,
-                splitTopic,
-                metrics;
+            // ensure the topic is relevant to the sparkplug client
+            if (!sparkplugTopicPatterns.some(pattern => topic.startsWith(pattern))) {
+                return;
+            }
+
+            let payload: UPayload;
+            let timestamp: number | Long.Long | null | undefined;
+            let splitTopic: string[];
+
+            // catch any errors thrown by the decodePayload function
+            try {
+                payload = this.maybeDecompressPayload(this.decodePayload(message));
+                timestamp = payload.timestamp;
+            } catch (err) {
+                this.emit("error", err as Error);
+                return;
+            }
 
             this.messageAlert("arrived", topic, payload);
 
